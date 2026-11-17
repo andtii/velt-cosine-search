@@ -5,9 +5,9 @@ A brute-force cosine similarity search written in [Velt](https://veltlang.com) 0
 **Result.** On an Apple M4, Velt's f32 SIMD kernel runs within 1–6% of hand-written C NEON. int8 search of 100k × 384 vectors takes about 1 ms on 10 cores at 0.975–0.99 recall@10. Four problems cost the most:
 
 1. Closures that deep-copied their captures on every call (21× slower end to end). **Already fixed on main** by [velt-lang/velt#2734](https://github.com/velt-lang/velt/pull/2734), after the 0.6.0 release.
-2. `bf16x8.dotAdd` is 3.7× slower than C's `bfdot`, because it quiets NaN payloads lane by lane. Not yet filed.
+2. `bf16x8.dotAdd` is 3.7× slower than C's `bfdot`, because it quiets NaN payloads lane by lane. Filed as [velt-lang/velt#3129](https://github.com/velt-lang/velt/issues/3129).
 3. Bounds checks that only go away with the `fits()` idiom, and an array pointer reloaded every iteration. Partly tracked.
-4. No `exp`, `log` or trig functions in `Math`. Not yet filed.
+4. No `exp`, `log` or trig functions in `Math`. Filed as [velt-lang/velt#3130](https://github.com/velt-lang/velt/issues/3130).
 
 ## Contents
 
@@ -32,9 +32,9 @@ Ranked by how much they cost in this workload. Every finding has a repro in this
 | # | Finding | Severity | Measured impact | Status on main | Suggested fix |
 |---|---|---|---|---|---|
 | 1 | An async closure passed to a nested (local) function deep-copied its read-only captures on every call | High | f32 search 92 → 4.35 ms per query once avoided (21×); +42% instructions and +53 MB peak memory in a minimal repro | **Fixed** by #2734; verified: overhead +0.3%, no transfer in the IR | — |
-| 2 | `bf16x8.dotAdd` quiets NaN payloads lane by lane before every FMA | High for bf16 users | 150 ns vs 38 ns (C f16) and 41 ns (C `bfdot`) per 384-dim dot | Still present | Plain shift inside `dotAdd`; pick `bfdot` at run time |
+| 2 | `bf16x8.dotAdd` quiets NaN payloads lane by lane before every FMA | High for bf16 users | 150 ns vs 38 ns (C f16) and 41 ns (C `bfdot`) per 384-dim dot | Still present; [#3129](https://github.com/velt-lang/velt/issues/3129) | Plain shift inside `dotAdd`; pick `bfdot` at run time |
 | 3 | Bounds checks in SIMD loops only go away with `T.fits()`; the array data pointer is reloaded every iteration | Medium | f32 61 vs 46 ns (+34%) without `fits()`; int8 15.7 vs 11.0 ns in C (1.4×) | Still present (same int8 loop) | Loop versioning; hoist the buffer pointer; offset/length forms of std `dotI8`/`dotF16` |
-| 4 | `Math` has no `exp`, `log`, `sin`, `cos`, `tanh`, `atan2`, `cbrt` or `log2`; the error says "not a static method" | Medium | Blocks softmax, GELU, most ML and geometry code | Still present | Add them; until then a "not supported yet" error |
+| 4 | `Math` has no `exp`, `log`, `sin`, `cos`, `tanh`, `atan2`, `cbrt` or `log2`; the error says "not a static method" | Medium | Blocks softmax, GELU, most ML and geometry code | Still present; [#3130](https://github.com/velt-lang/velt/issues/3130) | Add them; until then a "not supported yet" error |
 | 5 | Smaller: `f32` has no `toFixed`; `i64` needs `as number` for `Math.ceil`; no relaxed-FP reduction; 128-bit vectors only; `shared(x)` needs a copy to keep using `x` | Low each | Relaxed FP is 5.7× in C; `freeze()` copies 147 MiB | `toFixed` still missing; others planned | See [Smaller findings](#smaller-findings) |
 
 ## Existing issues and PRs
@@ -45,12 +45,13 @@ Searched in [velt-lang/velt](https://github.com/velt-lang/velt) on 2026-11-17, f
 |---|---|---|
 | 1. Capture copies | [#2726](https://github.com/velt-lang/velt/issues/2726) (open, design) | Exactly this: "async closures copy their captures where they cross threads, not on every call". It says the cost "hasn't been measured yet"; the numbers here are a measurement |
 | | [#2734](https://github.com/velt-lang/velt/pull/2734) (merged 2026-11-11) | Step 1 of #2726: "a call through a function value is no thread boundary". Fixes this finding; not in 0.6.0 (released 2026-11-07) |
-| 2. bf16 `dotAdd` | [#2387](https://github.com/velt-lang/velt/pull/2387) (merged) | Added `dotAdd`/`dotAddFast` on `f16x8` and `bf16x8`. No issue about the bf16 slowness found |
+| 2. bf16 `dotAdd` | [#3129](https://github.com/velt-lang/velt/issues/3129) (filed from this report) | This finding, with a self-contained repro |
+| | [#2387](https://github.com/velt-lang/velt/pull/2387) (merged) | Added `dotAdd`/`dotAddFast` on `f16x8` and `bf16x8` |
 | | [#2049](https://github.com/velt-lang/velt/issues/2049) (open) | The f16/bf16 design, including the NaN-quieting contract |
 | 3. Bounds checks | [#2485](https://github.com/velt-lang/velt/issues/2485) (open) | `fits_pair` follow-ups. Mentions the loop invariant not hoisted **on x86**; the arm64 pointer reload and the hand-written `i + 16 <= dim` case are not covered |
 | | [#2335](https://github.com/velt-lang/velt/pull/2335) (merged) | `fits(a, j) && fits(b, j)` merged into one test |
 | | [#1718](https://github.com/velt-lang/velt/issues/1718) (open) | Borrowed byte views checked per range, the kind of sub-range view the std dot products would need |
-| 4. `Math` functions | — | Nothing found for `exp`/`log`/`sin`. [#1676](https://github.com/velt-lang/velt/issues/1676) and PR [#3086](https://github.com/velt-lang/velt/pull/3086) are about `Math.pow` |
+| 4. `Math` functions | [#3130](https://github.com/velt-lang/velt/issues/3130) (filed from this report) | Nothing existed before for `exp`/`log`/`sin`. [#1676](https://github.com/velt-lang/velt/issues/1676) and PR [#3086](https://github.com/velt-lang/velt/pull/3086) are about `Math.pow` |
 | Relaxed FP, wider vectors | [#1866](https://github.com/velt-lang/velt/issues/1866) areas 8 and 10, [#1981](https://github.com/velt-lang/velt/issues/1981) rows 8 and 10 | Scoped `@fastmath` lowering to `reassoc contract`; `f32x8`/`f32x16` |
 | Runtime CPU dispatch | [#1981](https://github.com/velt-lang/velt/issues/1981) step 5 | CPU features as a table, constant checks under `--cpu` |
 | `f32.toFixed` | [#3039](https://github.com/velt-lang/velt/pull/3039) (open) | Number formatting leftovers; doesn't mention `f32` |

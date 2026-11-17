@@ -1,0 +1,181 @@
+// Storage-format benchmark: f32 vs f16 vs bf16 vs int8, single thread and all cores,
+// with recall@k against the exact f32 ranking.
+//
+//   velt run --release bench/quant.velt
+//   velt run --release --cpu native bench/quant.velt      (bfdot / FEAT_BF16 on M2+)
+//   velt run --release bench/quant.velt -- --n 200000 --dim 768 --rounds 5
+import { args } from "velt/process";
+import { random } from "velt/random";
+import { workerCount } from "velt/task";
+import { VectorIndex } from "../src/index";
+import type { Result } from "../src/index";
+import { CompressedIndex } from "../src/compressed";
+import type { Format } from "../src/compressed";
+
+function flag(argv: string[], name: string, fallback: string): string {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : fallback;
+}
+
+function uniform(dim: i64, amp: number): f32[] {
+  const v: f32[] = [];
+  for (let i: i64 = 0; i < dim; i++) {
+    v.push(((random() * 2 - 1) * amp) as f32);
+  }
+  return v;
+}
+
+// A point of cluster `c`: its centroid plus uniform noise.
+function around(c: f32[], noise: number): f32[] {
+  const v: f32[] = [];
+  for (let i = 0; i < c.length; i++) {
+    v.push(c[i] + ((random() * 2 - 1) * noise) as f32);
+  }
+  return v;
+}
+
+function recall(truth: Result[], got: Result[]): number {
+  let hit = 0;
+  for (const t of truth) {
+    for (const g of got) {
+      if (g.id == t.id) {
+        hit++;
+        break;
+      }
+    }
+  }
+  return truth.length == 0 ? 1 : hit / truth.length;
+}
+
+function pad(s: string, n: i64): string {
+  return s.padStart(n as number);
+}
+
+type Row = { name: string; bytes: i64; best: number; median: number; recall: number; top1: number };
+
+// Benchmark state, passed explicitly. (Capturing it in a closure of `main` and handing
+// that closure to a nested function made every call deep-copy the captured index:
+// see REPORT, finding "per-call deep copy of captures".)
+type Ctx = { qs: f32[][]; truth: Result[][]; rounds: i64; only: string; rows: Row[] };
+
+async function measure(ctx: Ctx, name: string, bytes: i64, run: (q: f32[]) => Promise<Result[]>) {
+  if (ctx.only != "" && !name.startsWith(ctx.only)) {
+    return;
+  }
+  const qs = ctx.qs;
+  const truth = ctx.truth;
+  const nq = qs.length;
+  const rounds = ctx.rounds;
+  const times: number[] = [];
+  let got: Result[][] = [];
+  for (let r: i64 = 0; r < rounds; r++) {
+    const out: Result[][] = [];
+    const t0 = performance.now();
+    for (const q of qs) {
+      out.push(await run(q));
+    }
+    times.push((performance.now() - t0) / (nq as number));
+    got = out;
+  }
+  times.sort();
+  let rec = 0;
+  let top1 = 0;
+  for (let i = 0; i < qs.length; i++) {
+    rec += recall(truth[i], got[i]);
+    if (got[i].length > 0 && got[i][0].id == truth[i][0].id) {
+      top1++;
+    }
+  }
+  ctx.rows.push({
+    name: name,
+    bytes: bytes,
+    best: times[0],
+    median: times[Math.floor(times.length / 2)],
+    recall: rec / (nq as number),
+    top1: top1 / (nq as number),
+  });
+}
+
+async function main() {
+  const argv = args();
+  const n = Number.parseInt(flag(argv, "--n", "100000")) as i64;
+  const dim = Number.parseInt(flag(argv, "--dim", "384")) as i64;
+  const nq = Number.parseInt(flag(argv, "--queries", "20")) as i64;
+  const rounds = Number.parseInt(flag(argv, "--rounds", "5")) as i64;
+  const k = Number.parseInt(flag(argv, "--k", "10")) as i64;
+  const clusters = Number.parseInt(flag(argv, "--clusters", "1000")) as i64;
+  const noise = Number.parseFloat(flag(argv, "--noise", "0.75"));
+  const workers = workerCount();
+
+  console.log(
+    `# n=${n} dim=${dim} queries=${nq} rounds=${rounds} k=${k} clusters=${clusters} noise=${noise} workers=${workers}`,
+  );
+
+  // ---- data: clustered, so the top-k are close calls quantization can get wrong
+  let t = performance.now();
+  const centroids: f32[][] = [];
+  for (let c: i64 = 0; c < clusters; c++) {
+    centroids.push(uniform(dim, 1));
+  }
+  const index = new VectorIndex(dim);
+  for (let i: i64 = 0; i < n; i++) {
+    index.add(`v${i}`, around(centroids[Math.floor(random() * (clusters as number))], noise));
+  }
+  const qs: f32[][] = [];
+  for (let i: i64 = 0; i < nq; i++) {
+    qs.push(around(centroids[Math.floor(random() * (clusters as number))], noise));
+  }
+  console.log(`# build f32 ${(performance.now() - t).toFixed(0)} ms`);
+
+  const formats: Format[] = ["f16", "bf16", "bf16fast", "i8"];
+  const comp: CompressedIndex[] = [];
+  for (const f of formats) {
+    t = performance.now();
+    comp.push(CompressedIndex.from(index, f));
+    console.log(`# build ${f} ${(performance.now() - t).toFixed(0)} ms`);
+  }
+  t = performance.now();
+  const frozen = index.freeze();
+  console.log(`# freeze f32 (copy into shared) ${(performance.now() - t).toFixed(0)} ms`);
+
+  // ---- ground truth: exact f32 (scalar) ranking
+  const truth: Result[][] = qs.map((q) => index.searchScalar(q, k));
+
+  // ---- end-to-end search benchmarks
+  const rows: Row[] = [];
+  const ctx: Ctx = {
+    qs: qs,
+    truth: truth,
+    rounds: rounds,
+    only: flag(argv, "--only", ""),
+    rows: rows,
+  };
+  await measure(ctx, "f32 scalar  x1", dim * 4, async (q) => index.searchScalar(q, k));
+  await measure(ctx, "f32 simd    x1", dim * 4, async (q) => index.search(q, k));
+  for (const c of comp) {
+    await measure(ctx, `${c.format.padEnd(11)} x1`, c.bytesPerVector, async (q) => c.search(q, k));
+  }
+  await measure(ctx, `f32 simd    x${workers}`, dim * 4, async (q) => frozen.search(q, k));
+  for (const c of comp) {
+    await measure(
+      ctx,
+      `${c.format.padEnd(11)} x${workers}`,
+      c.bytesPerVector,
+      async (q) => c.searchParallel(q, k),
+    );
+  }
+
+  console.log("");
+  console.log(
+    "| path | B/vec | ms/query (best) | ms/query (median) | M vec/s | GB/s | recall@" +
+      `${k} | top-1 |`,
+  );
+  console.log("|---|---|---|---|---|---|---|---|");
+  for (const r of ctx.rows) {
+    const mvs = (n as number) / r.best / 1000;
+    const gbs = ((n * r.bytes) as number) / r.best / 1e6;
+    console.log(
+      `| ${r.name} | ${r.bytes} | ${r.best.toFixed(2)} | ${r.median.toFixed(2)} | ${mvs.toFixed(1)} | ${gbs.toFixed(1)} | ${r.recall.toFixed(3)} | ${r.top1.toFixed(2)} |`,
+    );
+  }
+}

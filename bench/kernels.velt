@@ -1,0 +1,120 @@
+// Raw kernel speed, matching bench/kernels.c: one query (row 0) against every row,
+// no top-k, best of `rounds`. Prints ns per vector.
+//
+//   velt run --release bench/kernels.velt -- 100000 384 9
+//   velt run --release --cpu native bench/kernels.velt -- 100000 384 9
+import { args } from "velt/process";
+import { random } from "velt/random";
+import { f32x4, dotI8 as stdDotI8 } from "velt/simd";
+import { dotF16 as stdDotF16, narrowBf16, narrowF16 } from "velt/half";
+import { dot, dotScalar } from "../src/vec";
+import { dotBf16, dotBf16Fast, dotF16, dotI8 } from "../src/quant";
+
+// The f32 kernel exactly as first written: the loop condition is `i + 16 <= dim`, without
+// `fits`, so the four loads keep their own bounds checks. Kept to measure that difference.
+function dotNoFits(a: f32[], aAt: usize, b: f32[], bAt: usize, dim: usize): f32 {
+  let s0 = f32x4.splat(0);
+  let s1 = f32x4.splat(0);
+  let s2 = f32x4.splat(0);
+  let s3 = f32x4.splat(0);
+  let i: usize = 0;
+  while (i + 16 <= dim) {
+    s0 = f32x4.load(a, aAt + i).mulAddFast(f32x4.load(b, bAt + i), s0);
+    s1 = f32x4.load(a, aAt + i + 4).mulAddFast(f32x4.load(b, bAt + i + 4), s1);
+    s2 = f32x4.load(a, aAt + i + 8).mulAddFast(f32x4.load(b, bAt + i + 8), s2);
+    s3 = f32x4.load(a, aAt + i + 12).mulAddFast(f32x4.load(b, bAt + i + 12), s3);
+    i += 16;
+  }
+  let s = s0.add(s1).add(s2.add(s3)).sum();
+  while (i < dim) {
+    s += a[aAt + i] * b[bAt + i];
+    i++;
+  }
+  return s;
+}
+
+function main() {
+  const argv = args();
+  const n = (argv.length > 0 ? Number.parseInt(argv[0]) : 100000) as usize;
+  const d = (argv.length > 1 ? Number.parseInt(argv[1]) : 384) as usize;
+  const rounds = (argv.length > 2 ? Number.parseInt(argv[2]) : 7) as i64;
+
+  const f: f32[] = [];
+  const q8: i8[] = [];
+  for (let i: usize = 0; i < n * d; i++) {
+    const x = (random() * 2 - 1) as f32;
+    f.push(x);
+    q8.push(Math.trunc(x * 127) as i8);
+  }
+  const h = narrowF16(f);
+  const bf = narrowBf16(f);
+
+  let sink: number = 0;
+  function bench(name: string, body: () => number) {
+    let best = Infinity;
+    for (let r: i64 = 0; r < rounds; r++) {
+      const t0 = performance.now();
+      sink += body();
+      const el = performance.now() - t0;
+      if (el < best) {
+        best = el;
+      }
+    }
+    console.log(`| Velt ${name} | ${((best * 1e6) / (n as number)).toFixed(2)} |`);
+  }
+
+  console.log(`| Velt kernel (x1, no top-k), n=${n} dim=${d} | ns/vector (best) |`);
+  console.log("|---|---|");
+  bench("f32 dotScalar", () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dotScalar(f, r * d, f, 0, d);
+    }
+    return s;
+  });
+  bench("f32 f32x4, loop without fits()", () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dotNoFits(f, r * d, f, 0, d);
+    }
+    return s;
+  });
+  bench("f32 f32x4, loop with fits()", () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dot(f, r * d, f, 0, d);
+    }
+    return s;
+  });
+  bench("f16 f16x8.dotAdd", () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dotF16(h, r * d, h, 0, d);
+    }
+    return s;
+  });
+  bench("f16 std dotF16 (whole array, per-vector share)", () => stdDotF16(h, h));
+  bench("bf16 bf16x8.dotAdd", () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dotBf16(bf, r * d, bf, 0, d);
+    }
+    return s;
+  });
+  bench("bf16 bf16x8.dotAddFast", () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dotBf16Fast(bf, r * d, bf, 0, d);
+    }
+    return s;
+  });
+  bench("i8 i32x4.dotAdd", () => {
+    let s: i64 = 0;
+    for (let r: usize = 0; r < n; r++) {
+      s += dotI8(q8, r * d, q8, 0, d) as i64;
+    }
+    return s as number;
+  });
+  bench("i8 std dotI8 (whole array, per-vector share)", () => stdDotI8(q8, q8));
+  console.log(`# sink ${sink != 0 ? "+" : "0"}`);
+}

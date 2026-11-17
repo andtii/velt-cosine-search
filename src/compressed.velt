@@ -1,0 +1,154 @@
+// Compressed, read-only copies of a VectorIndex: f16 / bf16 (half the bytes of f32)
+// and int8 (a quarter), searched single-threaded or split across every worker.
+import { narrowBf16, narrowF16 } from "velt/half";
+import { workerCount } from "velt/task";
+import { normalized } from "./vec";
+import { dotBf16, dotBf16Fast, dotF16, dotI8, quantizeI8 } from "./quant";
+import { TopK } from "./topk";
+import type { Hit } from "./topk";
+import type { Result, VectorIndex } from "./index";
+
+export type Format = "f16" | "bf16" | "bf16fast" | "i8";
+
+export class Compressed {
+  format: Format;
+  dim: i64;
+  count: i64;
+  f16s: f16[] = [];
+  bf16s: bf16[] = [];
+  i8s: i8[] = [];
+  scales: f32[] = [];
+
+  constructor(format: Format, dim: i64, count: i64) {
+    this.format = format;
+    this.dim = dim;
+    this.count = count;
+  }
+
+  get bytesPerVector(): i64 {
+    return this.format == "i8" ? this.dim + 4 : this.dim * 2;
+  }
+}
+
+/// A query prepared for one format (narrowed or quantized once, not per row).
+type Query = { f16s: f16[]; bf16s: bf16[]; i8s: i8[]; scale: f32 };
+
+function prepare(format: Format, query: f32[]): Query {
+  const u = normalized(query);
+  const q: Query = { f16s: [], bf16s: [], i8s: [], scale: 1 };
+  if (format == "f16") {
+    q.f16s = narrowF16(u);
+  } else if (format == "i8") {
+    q.scale = quantizeI8(u, 0, u.length as usize, q.i8s);
+  } else {
+    q.bf16s = narrowBf16(u);
+  }
+  return q;
+}
+
+function scan(c: Compressed, q: Query, start: i64, end: i64, k: i64): TopK {
+  const top = new TopK(k);
+  const dim = c.dim as usize;
+  if (c.format == "f16") {
+    for (let r = start; r < end; r++) {
+      const s = dotF16(c.f16s, (r as usize) * dim, q.f16s, 0, dim);
+      if (s > top.floor()) {
+        top.push(r, s);
+      }
+    }
+  } else if (c.format == "bf16") {
+    for (let r = start; r < end; r++) {
+      const s = dotBf16(c.bf16s, (r as usize) * dim, q.bf16s, 0, dim);
+      if (s > top.floor()) {
+        top.push(r, s);
+      }
+    }
+  } else if (c.format == "bf16fast") {
+    for (let r = start; r < end; r++) {
+      const s = dotBf16Fast(c.bf16s, (r as usize) * dim, q.bf16s, 0, dim);
+      if (s > top.floor()) {
+        top.push(r, s);
+      }
+    }
+  } else {
+    for (let r = start; r < end; r++) {
+      const s =
+        (dotI8(c.i8s, (r as usize) * dim, q.i8s, 0, dim) as f32) * c.scales[r as number] * q.scale;
+      if (s > top.floor()) {
+        top.push(r, s);
+      }
+    }
+  }
+  return top;
+}
+
+async function scanTask(
+  c: shared<Compressed>,
+  q: Query,
+  start: i64,
+  end: i64,
+  k: i64,
+): Promise<Hit[]> {
+  return scan(c, q, start, end, k).sorted();
+}
+
+export class CompressedIndex {
+  ids: string[];
+  store: shared<Compressed>;
+
+  constructor(ids: string[], store: shared<Compressed>) {
+    this.ids = ids;
+    this.store = store;
+  }
+
+  static from(index: VectorIndex, format: Format): CompressedIndex {
+    const c = new Compressed(format, index.dim, index.size);
+    if (format == "f16") {
+      c.f16s = narrowF16(index.data);
+    } else if (format == "i8") {
+      const dim = index.dim as usize;
+      for (let r: i64 = 0; r < index.size; r++) {
+        c.scales.push(quantizeI8(index.data, (r as usize) * dim, dim, c.i8s));
+      }
+    } else {
+      c.bf16s = narrowBf16(index.data);
+    }
+    return new CompressedIndex(index.ids.clone(), shared(c));
+  }
+
+  get format(): Format {
+    return this.store.format;
+  }
+
+  get bytesPerVector(): i64 {
+    return this.store.bytesPerVector;
+  }
+
+  search(query: f32[], k: i64): Result[] {
+    const q = prepare(this.store.format, query);
+    return this.toResults(scan(this.store, q, 0, this.store.count, k).sorted());
+  }
+
+  async searchParallel(query: f32[], k: i64, parts: i64 = workerCount()): Promise<Result[]> {
+    const q = prepare(this.store.format, query);
+    const n = this.store.count;
+    const chunk = Math.ceil((n as number) / (parts as number)) as i64;
+    const tasks: Promise<Hit[]>[] = [];
+    for (let start: i64 = 0; start < n; start += chunk) {
+      const end = start + chunk < n ? start + chunk : n;
+      const s = this.store;
+      tasks.push(spawn(scanTask(s, q.clone(), start, end, k)));
+    }
+    const top = new TopK(k);
+    for (const hits of await Promise.all(tasks)) {
+      for (const h of hits) {
+        top.push(h.row, h.score);
+      }
+    }
+    return this.toResults(top.sorted());
+  }
+
+  toResults(hits: Hit[]): Result[] {
+    return hits.map((h) => ({ id: this.ids[h.row], score: h.score }));
+  }
+}

@@ -1,0 +1,50 @@
+// One calling style per run, so CPU time and peak RSS (from `/usr/bin/time -l`) can be
+// compared on a loaded machine where wall-clock timings are noise.
+//   velt build --release bench/callshape.velt -o target/callshape
+//   /usr/bin/time -l target/callshape none|direct|param|nested
+import { args } from "velt/process";
+import { random } from "velt/random";
+import { VectorIndex } from "../src/index";
+import type { Result } from "../src/index";
+
+const CALLS: i64 = 200;
+
+async function viaParam(run: (q: f32[]) => Promise<Result[]>, q: f32[]): Promise<number> {
+  let s = 0;
+  for (let i: i64 = 0; i < CALLS; i++) {
+    s += (await run(q)).length;
+  }
+  return s;
+}
+
+async function main() {
+  const mode = args().length > 0 ? args()[0] : "none";
+  const dim: i64 = 384;
+  const index = new VectorIndex(dim);
+  for (let i: i64 = 0; i < 100000; i++) {
+    const v: f32[] = [];
+    for (let j: i64 = 0; j < dim; j++) {
+      v.push((random() * 2 - 1) as f32);
+    }
+    index.add(`v${i}`, v);
+  }
+  const q = index.data.slice(0, 384);
+  let s = 0;
+  if (mode == "direct") {
+    for (let i: i64 = 0; i < CALLS; i++) {
+      s += index.search(q, 10).length;
+    }
+  } else if (mode == "param") {
+    s = await viaParam(async (x) => index.search(x, 10), q);
+  } else if (mode == "nested") {
+    async function nested(run: (q: f32[]) => Promise<Result[]>): Promise<number> {
+      let t = 0;
+      for (let i: i64 = 0; i < CALLS; i++) {
+        t += (await run(q)).length;
+      }
+      return t;
+    }
+    s = await nested(async (x) => index.search(x, 10));
+  }
+  console.log(`${mode} ${s}`);
+}

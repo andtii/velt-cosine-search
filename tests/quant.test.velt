@@ -1,0 +1,88 @@
+import { fnv1a64 } from "velt/hash";
+import { narrowBf16, narrowF16 } from "velt/half";
+import { dotBf16, dotBf16Fast, dotF16, dotI8, quantizeI8 } from "../src/quant";
+import { VectorIndex } from "../src/index";
+import { CompressedIndex } from "../src/compressed";
+import type { Format } from "../src/compressed";
+
+// Deterministic values in [-1, 1) from a hash, so rows with different seeds are unrelated
+// (a linear formula made some rows shifted near-copies of others).
+function data(n: i64, seed: i64): f32[] {
+  const v: f32[] = [];
+  for (let i: i64 = 0; i < n; i++) {
+    v.push((((fnv1a64(`${seed}:${i}`) % 2000) as number) / 1000 - 1) as f32);
+  }
+  return v;
+}
+
+function ref(a: f32[], aAt: i64, b: f32[], bAt: i64, n: i64): number {
+  let s = 0;
+  for (let i: i64 = 0; i < n; i++) {
+    s += (a[(aAt + i) as number] as number) * (b[(bAt + i) as number] as number);
+  }
+  return s;
+}
+
+export function test_f16_bf16_kernels_match_widened_reference_for_every_tail() {
+  for (let n: i64 = 0; n < 50; n++) {
+    const a = data(n + 5, 1);
+    const b = data(n + 5, 2);
+    // reference on the values as rounded to 16 bits, so only summation order differs
+    const ah = narrowF16(a);
+    const bh = narrowF16(b);
+    const ab = narrowBf16(a);
+    const bb = narrowBf16(b);
+    const wh: f32[] = ah.map((x) => x as f32);
+    const wbh: f32[] = bh.map((x) => x as f32);
+    const wb: f32[] = ab.map((x) => x as f32);
+    const wbb: f32[] = bb.map((x) => x as f32);
+    const eh = ref(wh, 5, wbh, 5, n);
+    const eb = ref(wb, 5, wbb, 5, n);
+    assert(Math.abs(dotF16(ah, 5, bh, 5, n as usize) - eh) < 1e-3, `f16 n=${n}`);
+    assert(Math.abs(dotBf16(ab, 5, bb, 5, n as usize) - eb) < 1e-3, `bf16 n=${n}`);
+    assert(Math.abs(dotBf16Fast(ab, 5, bb, 5, n as usize) - eb) < 1e-2, `bf16fast n=${n}`);
+  }
+}
+
+export function test_i8_kernel_is_exact_for_every_tail() {
+  for (let n: i64 = 0; n < 70; n++) {
+    const a: i8[] = [];
+    const b: i8[] = [];
+    let e: i64 = 0;
+    for (let i: i64 = 0; i < n + 3; i++) {
+      const x = (((i * 37) % 255) - 127) as i8;
+      const y = (((i * 91) % 255) - 127) as i8;
+      a.push(x);
+      b.push(y);
+      if (i >= 3) {
+        e += (x as i64) * (y as i64);
+      }
+    }
+    assertEq(dotI8(a, 3, b, 3, n as usize) as i64, e, `n=${n}`);
+  }
+}
+
+export function test_quantize_i8_round_trips_within_half_a_step() {
+  const v = data(64, 3);
+  const q: i8[] = [];
+  const scale = quantizeI8(v, 0, 64, q);
+  for (let i = 0; i < 64; i++) {
+    assert(Math.abs((q[i] as number) * scale - v[i]) <= scale / 2 + 1e-6, `i=${i}`);
+  }
+}
+
+export async function test_compressed_indexes_agree_with_f32_on_clear_winner() {
+  const dim: i64 = 48;
+  const index = new VectorIndex(dim);
+  for (let r: i64 = 0; r < 300; r++) {
+    index.add(`r${r}`, data(dim, r + 10));
+  }
+  const q = data(dim, 77 + 10); // row 77 itself
+  assertEq(index.search(q, 1)[0].id, "r77");
+  const formats: Format[] = ["f16", "bf16", "bf16fast", "i8"];
+  for (const f of formats) {
+    const c = CompressedIndex.from(index, f);
+    assertEq(c.search(q, 1)[0].id, "r77", f);
+    assertEq((await c.searchParallel(q, 1, 4))[0].id, "r77", `${f} parallel`);
+  }
+}

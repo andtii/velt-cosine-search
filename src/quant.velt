@@ -1,0 +1,101 @@
+// Dot-product kernels for compressed storage: f16, bf16 (2 bytes/dim) and int8 (1 byte/dim).
+// Each works on rows stored back to back, like vec.velt's f32 `dot`.
+import { bf16x8, f16x8, f32x4, i32x4, i8x16 } from "velt/simd";
+
+/// f16 x f16 dot product, accumulated in f32 (exact products: f16x8.dotAdd, fmlal on Apple CPUs).
+export function dotF16(a: f16[], aAt: usize, b: f16[], bAt: usize, dim: usize): f32 {
+  let s0 = f32x4.splat(0);
+  let s1 = f32x4.splat(0);
+  let i: usize = 0;
+  while (i + 16 <= dim && f16x8.fits(a, aAt + i + 8) && f16x8.fits(b, bAt + i + 8)) {
+    s0 = f16x8.load(a, aAt + i).dotAdd(f16x8.load(b, bAt + i), s0);
+    s1 = f16x8.load(a, aAt + i + 8).dotAdd(f16x8.load(b, bAt + i + 8), s1);
+    i += 16;
+  }
+  while (i + 8 <= dim && f16x8.fits(a, aAt + i) && f16x8.fits(b, bAt + i)) {
+    s0 = f16x8.load(a, aAt + i).dotAdd(f16x8.load(b, bAt + i), s0);
+    i += 8;
+  }
+  let s = s0.add(s1).sum();
+  while (i < dim) {
+    s += (a[aAt + i] as f32) * (b[bAt + i] as f32);
+    i++;
+  }
+  return s;
+}
+
+/// bf16 x bf16, bit-exact on every CPU (bf16x8.dotAdd).
+export function dotBf16(a: bf16[], aAt: usize, b: bf16[], bAt: usize, dim: usize): f32 {
+  let s0 = f32x4.splat(0);
+  let s1 = f32x4.splat(0);
+  let i: usize = 0;
+  while (i + 16 <= dim && bf16x8.fits(a, aAt + i + 8) && bf16x8.fits(b, bAt + i + 8)) {
+    s0 = bf16x8.load(a, aAt + i).dotAdd(bf16x8.load(b, bAt + i), s0);
+    s1 = bf16x8.load(a, aAt + i + 8).dotAdd(bf16x8.load(b, bAt + i + 8), s1);
+    i += 16;
+  }
+  let s = s0.add(s1).sum();
+  while (i < dim) {
+    s += (a[aAt + i] as f32) * (b[bAt + i] as f32);
+    i++;
+  }
+  return s;
+}
+
+/// bf16 x bf16 with the CPU's own bf16 dot product where `--cpu` has one (bfdot on M2+).
+/// Only the lane sum is meaningful; the last bits differ from dotBf16.
+export function dotBf16Fast(a: bf16[], aAt: usize, b: bf16[], bAt: usize, dim: usize): f32 {
+  let s0 = f32x4.splat(0);
+  let s1 = f32x4.splat(0);
+  let i: usize = 0;
+  while (i + 16 <= dim && bf16x8.fits(a, aAt + i + 8) && bf16x8.fits(b, bAt + i + 8)) {
+    s0 = bf16x8.load(a, aAt + i).dotAddFast(bf16x8.load(b, bAt + i), s0);
+    s1 = bf16x8.load(a, aAt + i + 8).dotAddFast(bf16x8.load(b, bAt + i + 8), s1);
+    i += 16;
+  }
+  let s = s0.add(s1).sum();
+  while (i < dim) {
+    s += (a[aAt + i] as f32) * (b[bAt + i] as f32);
+    i++;
+  }
+  return s;
+}
+
+/// int8 x int8 dot product, exact in i32 (i32x4.dotAdd: sdot where the CPU has it).
+export function dotI8(a: i8[], aAt: usize, b: i8[], bAt: usize, dim: usize): i32 {
+  let s0 = i32x4.splat(0);
+  let s1 = i32x4.splat(0);
+  let i: usize = 0;
+  while (i + 32 <= dim && i8x16.fits(a, aAt + i + 16) && i8x16.fits(b, bAt + i + 16)) {
+    s0 = s0.dotAdd(i8x16.load(a, aAt + i), i8x16.load(b, bAt + i));
+    s1 = s1.dotAdd(i8x16.load(a, aAt + i + 16), i8x16.load(b, bAt + i + 16));
+    i += 32;
+  }
+  while (i + 16 <= dim && i8x16.fits(a, aAt + i) && i8x16.fits(b, bAt + i)) {
+    s0 = s0.dotAdd(i8x16.load(a, aAt + i), i8x16.load(b, bAt + i));
+    i += 16;
+  }
+  let s = s0.add(s1).sum();
+  while (i < dim) {
+    s += (a[aAt + i] as i32) * (b[bAt + i] as i32);
+    i++;
+  }
+  return s;
+}
+
+/// Symmetric per-vector int8 quantization of `v` (already unit length) into `out`;
+/// returns the scale that turns the int8 values back into floats (x ≈ q * scale).
+export function quantizeI8(v: f32[], vAt: usize, dim: usize, out: i8[]): f32 {
+  let m: f32 = 0;
+  for (let i: usize = 0; i < dim; i++) {
+    const x = Math.abs(v[vAt + i]) as f32;
+    if (x > m) {
+      m = x;
+    }
+  }
+  const inv: f32 = m > 0 ? 127 / m : 0;
+  for (let i: usize = 0; i < dim; i++) {
+    out.push(Math.round(v[vAt + i] * inv) as i8);
+  }
+  return m > 0 ? m / 127 : 0;
+}

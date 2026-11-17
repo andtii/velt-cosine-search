@@ -1,0 +1,154 @@
+// Cosine similarity search POC.
+//
+//   velt run --release                       text demo + benchmark (100k x 384)
+//   velt run --release -- --n 200000 --dim 768
+//   velt run --release -- --query "how do threads share memory"
+import { args } from "velt/process";
+import { random } from "velt/random";
+import { workerCount } from "velt/task";
+import { embed } from "./embed";
+import { VectorIndex } from "./index";
+import type { Result } from "./index";
+
+const DOCS: string[] = [
+  "Velt compiles TypeScript to native code through LLVM",
+  "SIMD vectors process four floats with one instruction",
+  "Cosine similarity measures the angle between two vectors",
+  "A dot product of unit vectors equals their cosine similarity",
+  "Garbage collectors pause programs to reclaim memory",
+  "Reference counting frees memory as soon as the last reference goes away",
+  "Async tasks run on every core of the machine",
+  "Threads share memory through atomics and mutexes",
+  "A min-heap keeps the top k results of a search",
+  "Vector databases index embeddings for semantic search",
+  "Brute-force search scans every stored vector",
+  "Approximate nearest neighbour indexes trade recall for speed",
+  "HTTP servers route requests to handlers",
+  "The recipe needs flour, sugar, butter and eggs",
+  "Bake the bread at two hundred degrees for forty minutes",
+  "The football match ended in a draw after extra time",
+  "Neural networks turn text into embedding vectors",
+  "Quantized int8 weights make inference faster",
+];
+
+function show(title: string, rs: Result[]) {
+  console.log(`  ${title}`);
+  for (const r of rs) {
+    console.log(`    ${(r.score as number).toFixed(3)}  ${r.id}`);
+  }
+}
+
+async function textDemo(dim: i64, extra: string[]) {
+  console.log(`== Text search (hashing-trick embeddings, dim ${dim}, ${DOCS.length} docs)`);
+  const index = new VectorIndex(dim);
+  for (const d of DOCS) {
+    index.add(d, embed(d, dim));
+  }
+  const queries =
+    extra.length > 0
+      ? extra
+      : [
+        "cosine similarity of vectors",
+        "how is memory freed without a collector",
+        "baking bread",
+        "parallel threads",
+      ];
+  for (const q of queries) {
+    show(`"${q}"`, index.search(embed(q, dim), 3));
+  }
+}
+
+function randomVector(dim: i64): f32[] {
+  const v: f32[] = [];
+  for (let i: i64 = 0; i < dim; i++) {
+    v.push((random() * 2 - 1) as f32);
+  }
+  return v;
+}
+
+function sameIds(a: Result[], b: Result[]): boolean {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id != b[i].id) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function benchmark(n: i64, dim: i64, queries: i64, k: i64) {
+  console.log(`\n== Benchmark: ${n} random vectors x ${dim} dims, top-${k}, ${queries} queries`);
+  const index = new VectorIndex(dim);
+  let t = performance.now();
+  for (let i: i64 = 0; i < n; i++) {
+    index.add(`v${i}`, randomVector(dim));
+  }
+  console.log(
+    `  built in ${(performance.now() - t).toFixed(0)} ms (${((n * dim * 4) as number / 1048576).toFixed(0)} MiB)`,
+  );
+
+  const qs: f32[][] = [];
+  for (let i: i64 = 0; i < queries; i++) {
+    // A query near a stored vector, so the right answer is known: v<target> ranks first.
+    const target = Math.floor(random() * (n as number)) as i64;
+    const v: f32[] = [];
+    for (let j: i64 = 0; j < dim; j++) {
+      v.push(index.data[(target * dim + j) as number] + ((random() * 2 - 1) * 0.02) as f32);
+    }
+    qs.push(v);
+  }
+
+  t = performance.now();
+  const scalar: Result[][] = qs.map((q) => index.searchScalar(q, k));
+  const tScalar = (performance.now() - t) / (queries as number);
+
+  t = performance.now();
+  const simd: Result[][] = qs.map((q) => index.search(q, k));
+  const tSimd = (performance.now() - t) / (queries as number);
+
+  const frozen = index.freeze();
+  t = performance.now();
+  const par: Result[][] = [];
+  for (const q of qs) {
+    par.push(await frozen.search(q, k));
+  }
+  const tPar = (performance.now() - t) / (queries as number);
+
+  let agree = 0;
+  for (let i = 0; i < qs.length; i++) {
+    if (sameIds(scalar[i], simd[i]) && sameIds(simd[i], par[i])) {
+      agree++;
+    }
+  }
+  const rate = (ms: number) => ((n as number) / ms / 1000).toFixed(1);
+  console.log(
+    `  scalar       ${tScalar.toFixed(2).padStart(8)} ms/query  ${rate(tScalar).padStart(7)} M vec/s`,
+  );
+  console.log(
+    `  SIMD f32x4   ${tSimd.toFixed(2).padStart(8)} ms/query  ${rate(tSimd).padStart(7)} M vec/s  (${(tScalar / tSimd).toFixed(1)}x)`,
+  );
+  console.log(
+    `  SIMD x ${String(workerCount()).padEnd(4)}  ${tPar.toFixed(2).padStart(8)} ms/query  ${rate(tPar).padStart(7)} M vec/s  (${(tScalar / tPar).toFixed(1)}x)`,
+  );
+  console.log(`  results identical across all three: ${agree}/${queries}`);
+  show(`sample: top-${k} for query 0`, par[0]);
+}
+
+function flag(argv: string[], name: string, fallback: string): string {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : fallback;
+}
+
+async function main() {
+  const argv = args();
+  const n = Number.parseInt(flag(argv, "--n", "100000")) as i64;
+  const dim = Number.parseInt(flag(argv, "--dim", "384")) as i64;
+  const queries = Number.parseInt(flag(argv, "--queries", "20")) as i64;
+  const query = flag(argv, "--query", "");
+  await textDemo(256, query == "" ? [] : [query]);
+  if (query == "") {
+    await benchmark(n, dim, queries, 5);
+  }
+}

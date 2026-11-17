@@ -1,0 +1,36 @@
+// A tiny, dependency-free text embedding: the hashing trick.
+//
+// Each word and each character trigram of a word is hashed (FNV-1a 64) to one of
+// `dim` buckets with a ±1 sign. Texts sharing words or word pieces point the same
+// way, so cosine similarity finds lexical neighbours ("index" ~ "indexing"). It is
+// a stand-in for a real model's embeddings, which this index would store the same way.
+import { fnv1a64 } from "velt/hash";
+
+function tokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 0);
+}
+
+function addFeature(v: f32[], feature: string, weight: f32) {
+  const h = fnv1a64(feature);
+  const bucket = (h % (v.length as u64)) as number;
+  const sign: f32 = (h >> 63) == 0 ? 1 : -1;
+  v[bucket] = v[bucket] + sign * weight;
+}
+
+export function embed(text: string, dim: i64): f32[] {
+  const v: f32[] = [];
+  for (let i: i64 = 0; i < dim; i++) {
+    v.push(0);
+  }
+  for (const w of tokens(text)) {
+    addFeature(v, "w:" + w, 1);
+    const padded = "#" + w + "#";
+    for (let i = 0; i + 3 <= padded.length; i++) {
+      addFeature(v, "t:" + padded.substring(i, i + 3), 0.5);
+    }
+  }
+  return v;
+}

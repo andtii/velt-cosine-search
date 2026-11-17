@@ -1,0 +1,125 @@
+// A flat (brute-force) cosine-similarity index.
+//
+// Vectors are normalized when added, so cosine(q, v) is just dot(q̂, v̂): a search is
+// one SIMD dot product per stored row plus a top-k heap. Rows live back to back in
+// one f32[] for sequential, cache-friendly scans.
+import { workerCount } from "velt/task";
+import { dot, dotScalar, normalized } from "./vec";
+import { TopK } from "./topk";
+import type { Hit } from "./topk";
+
+export type Result = { id: string; score: f32 };
+
+export class VectorIndex {
+  dim: i64;
+  ids: string[] = [];
+  data: f32[] = [];
+
+  constructor(dim: i64) {
+    this.dim = dim;
+  }
+
+  get size(): i64 {
+    return this.ids.length;
+  }
+
+  add(id: string, v: f32[]) {
+    if (v.length != this.dim) {
+      throw new RangeError(`vector for ${id} has ${v.length} dims, index has ${this.dim}`);
+    }
+    const u = normalized(v);
+    for (let i = 0; i < u.length; i++) {
+      this.data.push(u[i]);
+    }
+    this.ids.push(id);
+  }
+
+  /// The `k` stored vectors most similar to `query`, best first (SIMD, one thread).
+  search(query: f32[], k: i64): Result[] {
+    const q = normalized(query);
+    return this.toResults(scan(this.data, q, this.dim as usize, 0, this.size, k, false).sorted());
+  }
+
+  /// The same search without SIMD, for checking and benchmarking.
+  searchScalar(query: f32[], k: i64): Result[] {
+    const q = normalized(query);
+    return this.toResults(scan(this.data, q, this.dim as usize, 0, this.size, k, true).sorted());
+  }
+
+  /// A read-only copy of the rows that tasks on every core can scan at once.
+  freeze(): FrozenIndex {
+    return new FrozenIndex(this.dim, this.ids.clone(), shared(this.data.clone()));
+  }
+
+  toResults(hits: Hit[]): Result[] {
+    return hits.map((h) => ({ id: this.ids[h.row], score: h.score }));
+  }
+}
+
+/// Scans rows `[start, end)` of `data` against the unit query `q`, keeping the best `k`.
+function scan(
+  data: f32[],
+  q: f32[],
+  dim: usize,
+  start: i64,
+  end: i64,
+  k: i64,
+  scalar: boolean,
+): TopK {
+  const top = new TopK(k);
+  for (let r = start; r < end; r++) {
+    const at = (r as usize) * dim;
+    const s = scalar ? dotScalar(data, at, q, 0, dim) : dot(data, at, q, 0, dim);
+    if (s > top.floor()) {
+      top.push(r, s);
+    }
+  }
+  return top;
+}
+
+async function scanShared(
+  data: shared<f32[]>,
+  q: f32[],
+  dim: usize,
+  start: i64,
+  end: i64,
+  k: i64,
+): Promise<Hit[]> {
+  return scan(data, q, dim, start, end, k, false).sorted();
+}
+
+/// An immutable index whose search splits the rows across every worker thread.
+export class FrozenIndex {
+  dim: i64;
+  ids: string[];
+  data: shared<f32[]>;
+
+  constructor(dim: i64, ids: string[], data: shared<f32[]>) {
+    this.dim = dim;
+    this.ids = ids;
+    this.data = data;
+  }
+
+  get size(): i64 {
+    return this.ids.length;
+  }
+
+  async search(query: f32[], k: i64, parts: i64 = workerCount()): Promise<Result[]> {
+    const q = normalized(query);
+    const n = this.size;
+    const chunk = Math.ceil((n as number) / (parts as number)) as i64;
+    const tasks: Promise<Hit[]>[] = [];
+    for (let start: i64 = 0; start < n; start += chunk) {
+      const end = start + chunk < n ? start + chunk : n;
+      const d = this.data;
+      tasks.push(spawn(scanShared(d, q.clone(), this.dim as usize, start, end, k)));
+    }
+    const top = new TopK(k);
+    for (const hits of await Promise.all(tasks)) {
+      for (const h of hits) {
+        top.push(h.row, h.score);
+      }
+    }
+    return top.sorted().map((h) => ({ id: this.ids[h.row], score: h.score }));
+  }
+}

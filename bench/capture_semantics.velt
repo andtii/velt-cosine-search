@@ -1,0 +1,33 @@
+// Does an async closure passed to a nested function see (and change) the object it captured,
+// as in TypeScript? Node prints: top-level 1 2 / nested 3 4
+class Box {
+  items: number[] = [];
+  add(x: number) {
+    this.items.push(x);
+  }
+}
+
+async function callTop(run: (x: number) => Promise<number>): Promise<void> {
+  await run(1);
+  await run(2);
+}
+
+async function main() {
+  const a = new Box();
+  await callTop(async (x) => {
+    a.add(x);
+    return a.items.length;
+  });
+  console.log("top-level", a.items.join(" "));
+
+  const b = new Box();
+  async function callNested(run: (x: number) => Promise<number>): Promise<void> {
+    await run(3);
+    await run(4);
+  }
+  await callNested(async (x) => {
+    b.add(x);
+    return b.items.length;
+  });
+  console.log("nested", b.items.join(" "));
+}

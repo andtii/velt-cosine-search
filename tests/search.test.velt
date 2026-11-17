@@ -1,0 +1,88 @@
+import { cosine, dot, dotScalar, normalized } from "../src/vec";
+import { TopK } from "../src/topk";
+import { VectorIndex } from "../src/index";
+import { embed } from "../src/embed";
+
+function close(a: number, b: number, eps: number = 1e-4): boolean {
+  return Math.abs(a - b) < eps;
+}
+
+function ramp(n: i64, f: (i: number) => number): f32[] {
+  const v: f32[] = [];
+  for (let i: i64 = 0; i < n; i++) {
+    v.push(f(i as number) as f32);
+  }
+  return v;
+}
+
+export function test_simd_dot_matches_scalar_for_every_tail_length() {
+  for (let n: i64 = 0; n < 40; n++) {
+    const a = ramp(n + 3, (i) => ((i * 37) % 11) - 5);
+    const b = ramp(n + 3, (i) => ((i * 13) % 7) * 0.5 - 1.5);
+    // offsets exercise loads that don't start at 0
+    assert(close(dot(a, 3, b, 3, n as usize), dotScalar(a, 3, b, 3, n as usize)), `n=${n}`);
+  }
+}
+
+export function test_cosine_known_values() {
+  const x: f32[] = [1, 0, 0];
+  const y: f32[] = [0, 1, 0];
+  const d: f32[] = [1, 1, 0];
+  const neg: f32[] = [-2, 0, 0];
+  const zero: f32[] = [0, 0, 0];
+  assert(close(cosine(x, x), 1));
+  assert(close(cosine(x, y), 0));
+  assert(close(cosine(x, d), Math.sqrt(0.5)));
+  assert(close(cosine(x, neg), -1));
+  assertEq(cosine(x, zero), 0 as f32);
+}
+
+export function test_normalized_has_unit_length() {
+  const u = normalized(ramp(37, (i) => i - 10));
+  assert(close(dot(u, 0, u, 0, 37), 1));
+}
+
+export function test_topk_keeps_best_in_order() {
+  const top = new TopK(3);
+  const scores: f32[] = [0.1, 0.9, 0.5, 0.7, 0.2, 0.8];
+  for (let i = 0; i < scores.length; i++) {
+    top.push(i as i64, scores[i]);
+  }
+  const rows = top.sorted().map((h) => h.row);
+  assertEq(rows.join(","), "1,5,3");
+}
+
+export function test_index_finds_nearest_and_rejects_wrong_dim() {
+  const index = new VectorIndex(4);
+  index.add("east", [1, 0, 0, 0]);
+  index.add("north", [0, 1, 0, 0]);
+  index.add("north-east", [1, 1, 0, 0]);
+  const rs = index.search([0.9, 1.1, 0, 0], 2);
+  assertEq(rs[0].id, "north-east");
+  assertEq(rs[1].id, "north");
+  assertEq(index.searchScalar([0.9, 1.1, 0, 0], 2)[0].id, "north-east");
+  assertThrows(() => index.add("bad", [1, 2]));
+}
+
+export async function test_parallel_search_matches_single_thread() {
+  const index = new VectorIndex(33);
+  for (let r = 0; r < 500; r++) {
+    index.add(`r${r}`, ramp(33, (i) => ((r * 7919 + i * 104729) % 1000) / 500 - 1));
+  }
+  const q = ramp(33, (i) => ((i * 31) % 17) / 8 - 1);
+  const a = index.search(q, 7).map((r) => r.id).join(",");
+  const frozen = index.freeze();
+  for (const parts of [1, 3, 8, 13] as i64[]) {
+    const b = (await frozen.search(q, 7, parts)).map((r) => r.id).join(",");
+    assertEq(b, a, `parts=${parts}`);
+  }
+}
+
+export function test_text_embedding_ranks_related_text_first() {
+  const index = new VectorIndex(256);
+  index.add("bread", embed("Bake the bread in the oven", 256));
+  index.add("simd", embed("SIMD vectors and dot products", 256));
+  index.add("football", embed("The football match was a draw", 256));
+  assertEq(index.search(embed("vector dot product", 256), 1)[0].id, "simd");
+  assertEq(index.search(embed("baking bread", 256), 1)[0].id, "bread");
+}

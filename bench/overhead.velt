@@ -1,0 +1,101 @@
+// Where does end-to-end search time go? Same index and query, called four ways.
+//   velt run --release bench/overhead.velt
+import { random } from "velt/random";
+import { VectorIndex } from "../src/index";
+import type { Result } from "../src/index";
+import { dot } from "../src/vec";
+
+function rv(dim: i64): f32[] {
+  const v: f32[] = [];
+  for (let i: i64 = 0; i < dim; i++) {
+    v.push((random() * 2 - 1) as f32);
+  }
+  return v;
+}
+
+function best(name: string, reps: i64, body: () => void) {
+  let b = Infinity;
+  for (let r: i64 = 0; r < reps; r++) {
+    const t0 = performance.now();
+    body();
+    const el = performance.now() - t0;
+    if (el < b) {
+      b = el;
+    }
+  }
+  console.log(`${name.padEnd(48)} ${b.toFixed(2)} ms`);
+}
+
+async function bestAsync(name: string, reps: i64, run: (q: f32[]) => Promise<Result[]>, q: f32[]) {
+  let b = Infinity;
+  for (let r: i64 = 0; r < reps; r++) {
+    const t0 = performance.now();
+    const rs = await run(q);
+    const el = performance.now() - t0;
+    if (el < b && rs.length > 0) {
+      b = el;
+    }
+  }
+  console.log(`${name.padEnd(48)} ${b.toFixed(2)} ms`);
+}
+
+async function main() {
+  const n: i64 = 100000;
+  const dim: i64 = 384;
+  const index = new VectorIndex(dim);
+  for (let i: i64 = 0; i < n; i++) {
+    index.add(`v${i}`, rv(dim));
+  }
+  const q = rv(dim);
+  const d = dim as usize;
+
+  best("raw dot loop over index.data", 7, () => {
+    let s: f32 = 0;
+    for (let r: usize = 0; r < (n as usize); r++) {
+      s += dot(index.data, r * d, q, 0, d);
+    }
+    if (s == 12345) {
+      console.log("x");
+    }
+  });
+  best("index.search (direct call)", 7, () => {
+    index.search(q, 10);
+  });
+  best("index.searchScalar (direct call)", 7, () => {
+    index.searchScalar(q, 10);
+  });
+  await bestAsync("index.search via async closure param", 7, async (x) => index.search(x, 10), q);
+  // The shape bench/quant.velt used: a nested async function (a closure of main) that is
+  // given another closure capturing `index`.
+  async function nested(name: string, run: (q: f32[]) => Promise<Result[]>) {
+    await bestAsync(name, 7, run, q);
+  }
+  await nested("index.search via closure through nested fn", async (x) => index.search(x, 10));
+  async function nestedLoop(name: string, run: (q: f32[]) => Promise<Result[]>) {
+    let b = Infinity;
+    for (let r: i64 = 0; r < 7; r++) {
+      const t0 = performance.now();
+      const rs = await run(q);
+      const el = performance.now() - t0;
+      if (el < b && rs.length > 0) {
+        b = el;
+      }
+    }
+    console.log(`${name.padEnd(48)} ${b.toFixed(2)} ms`);
+  }
+  await nestedLoop("same, timed inside the nested fn", async (x) => index.search(x, 10));
+  const frozen = index.freeze();
+  await bestAsync("frozen.search (all workers) via closure", 7, async (x) => frozen.search(x, 10), q);
+  best("index.ids.clone()", 7, () => {
+    const c = index.ids.clone();
+    if (c.length == 0) {
+      console.log("x");
+    }
+  });
+  best("index.data.clone()", 7, () => {
+    const c = index.data.clone();
+    if (c.length == 0) {
+      console.log("x");
+    }
+  });
+}

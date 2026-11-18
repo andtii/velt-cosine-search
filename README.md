@@ -5,9 +5,11 @@ A brute-force cosine similarity search written in [Velt](https://veltlang.com) 0
 **Result.** On an Apple M4, Velt's f32 SIMD kernel runs within 1–6% of hand-written C NEON. int8 search of 100k × 384 vectors takes about 1 ms on 10 cores at 0.975–0.99 recall@10. Four problems cost the most:
 
 1. Closures that deep-copied their captures on every call (21× slower end to end). **Already fixed on main** by [velt-lang/velt#2734](https://github.com/velt-lang/velt/pull/2734), after the 0.6.0 release.
-2. `bf16x8.dotAdd` is 3.7× slower than C's `bfdot`, because it quiets NaN payloads lane by lane. Filed as [velt-lang/velt#3129](https://github.com/velt-lang/velt/issues/3129).
-3. Bounds checks that only go away with the `fits()` idiom, and an array pointer reloaded every iteration. Partly tracked.
-4. No `exp`, `log` or trig functions in `Math`. Filed as [velt-lang/velt#3130](https://github.com/velt-lang/velt/issues/3130).
+2. `bf16x8.dotAdd` is 3.7× slower than C's `bfdot`, because it quiets NaN payloads lane by lane. Filed as [velt-lang/velt#3129](https://github.com/velt-lang/velt/issues/3129). **`dotAdd` fixed on main** by [velt-lang/velt#3143](https://github.com/velt-lang/velt/pull/3143); choosing `bfdot` at run time is still open.
+3. Bounds checks that only go away with the `fits()` idiom, and an array pointer reloaded every iteration. Partly tracked. std now has offset forms of its dot products (#3143); the compiler side is still open.
+4. No `exp`, `log` or trig functions in `Math`. Filed as [velt-lang/velt#3130](https://github.com/velt-lang/velt/issues/3130). **Fixed on main** by #3143.
+
+**Update, 2026-11-18.** [velt-lang/velt#3143](https://github.com/velt-lang/velt/pull/3143) is merged, after 0.6.0. It makes `bf16x8.dotAdd` a plain shift (213 → 58 ns per 384-dim dot on a Linux arm64 runner), adds `dotF16At`, `dotBf16At` and `dotI8At` (dot products over a range of two arrays), the ES `Math` functions (`exp`, `expm1`, `log1p`, `log2`, `log10`, the trigonometric, inverse and hyperbolic functions, `cbrt`) with Node's results bit for bit, `toFixed`/`toExponential`/`toPrecision` on `f32`, and `ceilDiv`/`floorDiv` in `velt/math`. A 256-bit `f32x8` is in review as [velt-lang/velt#3144](https://github.com/velt-lang/velt/pull/3144) (design: [#3140](https://github.com/velt-lang/velt/issues/3140)). The measurements and the text below describe 0.6.0 and main as of 2026-11-15; the Status column of the summary is up to date.
 
 ## Contents
 
@@ -32,10 +34,10 @@ Ranked by how much they cost in this workload. Every finding has a repro in this
 | # | Finding | Severity | Measured impact | Status on main | Suggested fix |
 |---|---|---|---|---|---|
 | 1 | An async closure passed to a nested (local) function deep-copied its read-only captures on every call | High | f32 search 92 → 4.35 ms per query once avoided (21×); +42% instructions and +53 MB peak memory in a minimal repro | **Fixed** by #2734; verified: overhead +0.3%, no transfer in the IR | — |
-| 2 | `bf16x8.dotAdd` quiets NaN payloads lane by lane before every FMA | High for bf16 users | 150 ns vs 38 ns (C f16) and 41 ns (C `bfdot`) per 384-dim dot | Still present; [#3129](https://github.com/velt-lang/velt/issues/3129) | Plain shift inside `dotAdd`; pick `bfdot` at run time |
-| 3 | Bounds checks in SIMD loops only go away with `T.fits()`; the array data pointer is reloaded every iteration | Medium | f32 61 vs 46 ns (+34%) without `fits()`; int8 15.7 vs 11.0 ns in C (1.4×) | Still present (same int8 loop) | Loop versioning; hoist the buffer pointer; offset/length forms of std `dotI8`/`dotF16` |
-| 4 | `Math` has no `exp`, `log`, `sin`, `cos`, `tanh`, `atan2`, `cbrt` or `log2`; the error says "not a static method" | Medium | Blocks softmax, GELU, most ML and geometry code | Still present; [#3130](https://github.com/velt-lang/velt/issues/3130) | Add them; until then a "not supported yet" error |
-| 5 | Smaller: `f32` has no `toFixed`; `i64` needs `as number` for `Math.ceil`; no relaxed-FP reduction; 128-bit vectors only; `shared(x)` needs a copy to keep using `x` | Low each | Relaxed FP is 5.7× in C; `freeze()` copies 147 MiB | `toFixed` still missing; others planned | See [Smaller findings](#smaller-findings) |
+| 2 | `bf16x8.dotAdd` quiets NaN payloads lane by lane before every FMA | High for bf16 users | 150 ns vs 38 ns (C f16) and 41 ns (C `bfdot`) per 384-dim dot | `dotAdd` **fixed** by #3143 (plain shift); run-time `bfdot` open in [#3129](https://github.com/velt-lang/velt/issues/3129) | Plain shift inside `dotAdd`; pick `bfdot` at run time |
+| 3 | Bounds checks in SIMD loops only go away with `T.fits()`; the array data pointer is reloaded every iteration | Medium | f32 61 vs 46 ns (+34%) without `fits()`; int8 15.7 vs 11.0 ns in C (1.4×) | Compiler side still present; std offset forms **added** by #3143 (`dotI8At`, `dotF16At`, `dotBf16At`) | Loop versioning; hoist the buffer pointer; offset/length forms of std `dotI8`/`dotF16` |
+| 4 | `Math` has no `exp`, `log`, `sin`, `cos`, `tanh`, `atan2`, `cbrt` or `log2`; the error says "not a static method" | Medium | Blocks softmax, GELU, most ML and geometry code | **Fixed** by #3143 ([#3130](https://github.com/velt-lang/velt/issues/3130) closed) | Add them; until then a "not supported yet" error |
+| 5 | Smaller: `f32` has no `toFixed`; `i64` needs `as number` for `Math.ceil`; no relaxed-FP reduction; 128-bit vectors only; `shared(x)` needs a copy to keep using `x` | Low each | Relaxed FP is 5.7× in C; `freeze()` copies 147 MiB | `f32.toFixed` and `ceilDiv` **added** by #3143; `f32x8` in review (#3144); others planned | See [Smaller findings](#smaller-findings) |
 
 ## Existing issues and PRs
 
